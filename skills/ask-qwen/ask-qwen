@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# ask-qwen: delegate a task to opencode (Qwen) in an isolated git worktree.
+#
+#   ask-qwen [-n name] [-s session] [-m model] [-a agent] [-t "verify cmd"] "task..."
+#   ask-qwen -n name -F brief.md [-t "verify cmd"]        # brief from a file (- = stdin)
+#
+# - Runs in ../<repo>-qwen-<name> on branch qwen/<name> (created from HEAD on first use),
+#   so Qwen never touches your working tree. Review with `git diff HEAD...qwen/<name>`.
+# - Headless, --auto, with a deny list as a guardrail (not a security boundary).
+# - Prints session id, tool calls, final answer and diff stat. Full log in $ASK_QWEN_LOG_DIR.
+# - Follow up on the same session with -s <session> (same -n).
+# - -t runs a check in the worktree afterwards: exit 0 only if Qwen finished AND the check passed
+#   (3 = check failed, 124 = timeout, 125 = opencode froze at startup twice). Every run is appended to $ASK_QWEN_LOG_DIR/runs.jsonl.
+set -euo pipefail
+# opencode adds itself to PATH only in ~/.zshrc, which non-interactive shells skip.
+export PATH="$HOME/.opencode/bin:$PATH"
+
+name=task
+session=
+model=
+agent=
+brief_file=
+verify=
+while getopts "n:s:m:a:F:t:h" opt; do
+  case $opt in
+    n) name=$OPTARG ;;
+    s) session=$OPTARG ;;
+    m) model=$OPTARG ;;
+    a) agent=$OPTARG ;;
+    F) brief_file=$OPTARG ;;
+    t) verify=$OPTARG ;;
+    *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+if [[ -n $brief_file ]]; then
+  prompt=$(cat -- "$brief_file")   # a file avoids shell-quoting trouble with long briefs
+else
+  [[ $# -ge 1 ]] || { echo "ask-qwen: missing task" >&2; exit 2; }
+  prompt=$*
+fi
+[[ -n ${prompt//[[:space:]]/} ]] || { echo "ask-qwen: empty task" >&2; exit 2; }
+
+if [[ -z ${QWEN_API_KEY:-} ]]; then
+  # Non-interactive shells don't read .zshrc; pick up only the key line.
+  eval "$(grep -m1 '^export QWEN_API_KEY=' ~/.zshrc 2>/dev/null || true)"
+fi
+[[ -n ${QWEN_API_KEY:-} ]] || { echo "ask-qwen: QWEN_API_KEY not set" >&2; exit 1; }
+export QWEN_API_KEY
+
+if [[ -z $model && -z ${ASK_QWEN_MODEL:-} ]]; then
+  eval "$(grep -m1 '^export ASK_QWEN_MODEL=' ~/.zshrc 2>/dev/null || true)"
+fi
+model=${model:-${ASK_QWEN_MODEL:-}}
+[[ -n $model ]] || { echo "ask-qwen: set ASK_QWEN_MODEL (opencode <provider>/<model>) or pass -m" >&2; exit 1; }
+
+repo=$(git rev-parse --show-toplevel)
+branch=qwen/$name
+wt=$(dirname "$repo")/$(basename "$repo")-qwen-$name
+if [[ ! -d $wt ]]; then
+  if git -C "$repo" show-ref --quiet "refs/heads/$branch"; then
+    git -C "$repo" worktree add -q "$wt" "$branch"
+  else
+    git -C "$repo" worktree add -q -b "$branch" "$wt" HEAD
+  fi
+  echo "ask-qwen: created worktree $wt on $branch" >&2
+fi
+
+# Guardrails, not a security boundary: chained commands are checked part by part, but
+# `bash -c`, python, find -delete etc. can still get around them. Use bwrap for real isolation.
+# "question" is denied because nobody is there to answer it in a headless run.
+export OPENCODE_CONFIG_CONTENT='{
+  "permission": {
+    "external_directory": "deny",
+    "question": "deny",
+    "skill": {"*": "allow", "ask-qwen": "deny"},
+    "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
+    "bash": {
+      "*": "allow",
+      "git push*": "deny", "git remote*": "deny", "git reset --hard*": "deny",
+      "git checkout*": "deny", "git switch*": "deny", "git worktree*": "deny",
+      "rm -rf*": "deny", "sudo *": "deny", "curl *": "deny", "wget *": "deny"
+    }
+  }
+}'
+
+log_dir=${ASK_QWEN_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ask-qwen}
+mkdir -p "$log_dir"
+log=$log_dir/$(date +%Y%m%d-%H%M%S)-$name.jsonl
+
+args=(run --standalone --auto --format json -m "$model" --title "ask-qwen:$name")
+[[ -n $session ]] && args+=(-s "$session")
+[[ -n $agent ]] && args+=(--agent "$agent")
+
+# The private --standalone server sometimes freezes at startup (seen: 5 min, and forever) before
+# emitting anything. Kill and retry when no event arrives within the startup window. We can't use
+# the shared background service instead: it ignores this process's env (key, guardrails).
+# setsid puts opencode and its `serve --stdio` child in one process group we can kill together.
+run_opencode() {
+  (cd "$wt" && exec setsid timeout "${ASK_QWEN_TIMEOUT:-1800}" opencode "${args[@]}" "$prompt") \
+    >"$log" 2>"$log.err" &
+  local pid=$! waited=0
+  while [[ ! -s $log ]] && kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= ${ASK_QWEN_STARTUP_TIMEOUT:-90} )); then
+      kill -- -"$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      return 125
+    fi
+    sleep 2; waited=$((waited + 2))
+  done
+  wait "$pid"
+}
+
+rc=0
+start=$(date +%s)
+for attempt in 1 2; do
+  rc=0
+  run_opencode || rc=$?
+  [[ $rc -eq 125 ]] || break
+  echo "ask-qwen: no output from opencode in ${ASK_QWEN_STARTUP_TIMEOUT:-90}s (startup freeze), attempt $attempt/2" >&2
+done
+
+elapsed=$(( $(date +%s) - start ))
+sid=$(jq -r 'select(.sessionID) | .sessionID' "$log" | head -1)
+tokens=$(jq -s '[.[] | select(.type=="step_finish") | .part.tokens] | {
+  input: (map(.input) | add // 0), output: (map(.output) | add // 0),
+  reasoning: (map(.reasoning) | add // 0), cache_read: (map(.cache.read) | add // 0),
+  cache_write: (map(.cache.write) | add // 0)}' "$log")
+echo "session:  ${sid:-?}   (follow up: ask-qwen -n $name -s ${sid:-?} \"...\")"
+echo "worktree: $wt   branch: $branch"
+echo "log:      $log"
+echo "usage:    ${elapsed}s, tokens $(jq -c . <<<"$tokens")"
+echo "--- tool calls"
+jq -r 'select(.type=="tool_use") | .part as $p
+  | "\($p.state.status | if . == "completed" then "ok " else "ERR" end) \($p.tool): "
+    + (($p.state.input.command // $p.state.input.path // $p.state.input.filePath // $p.state.input.pattern // ($p.state.input|tostring)) | tostring | .[0:120])
+    + (if $p.state.status != "completed" then "  <- " + (($p.state.error // "") | tostring | .[0:100]) else "" end)' "$log"
+echo "--- answer"
+jq -r 'select(.type=="text") | .part.text' "$log" | tail -n 40
+echo "--- changes (vs HEAD of $branch)"
+git -C "$wt" status --short
+git -C "$wt" diff --stat HEAD | tail -n 1
+
+verify_rc=
+if [[ -n $verify && $rc -eq 0 ]]; then
+  echo "--- verify: $verify"
+  verify_rc=0
+  (cd "$wt" && bash -c "$verify") >"$log.verify" 2>&1 || verify_rc=$?
+  tail -n 15 "$log.verify"
+  if [[ $verify_rc -eq 0 ]]; then echo "VERIFY PASS"; else echo "VERIFY FAIL (exit $verify_rc)"; fi
+fi
+
+jq -nc --arg name "$name" --arg session "$sid" --arg model "$model" --arg branch "$branch" \
+  --argjson rc "$rc" --argjson elapsed "$elapsed" --argjson tokens "$tokens" \
+  --arg verify "$verify" --arg verify_rc "$verify_rc" \
+  '{ts: (now | todate), name: $name, session: $session, model: $model, branch: $branch,
+    rc: $rc, elapsed_s: $elapsed, tokens: $tokens, verify: $verify,
+    verify_rc: (if $verify_rc == "" then null else ($verify_rc | tonumber) end)}' >>"$log_dir/runs.jsonl"
+
+if [[ $rc -ne 0 ]]; then
+  [[ $rc -eq 124 ]] && echo "ask-qwen: timed out after ${ASK_QWEN_TIMEOUT:-1800}s" >&2
+  [[ $rc -eq 125 ]] && echo "ask-qwen: gave up after 2 startup freezes" >&2
+  echo "ask-qwen: opencode exited $rc; see $log.err" >&2
+  tail -n 5 "$log.err" >&2
+  exit $rc
+fi
+[[ -z $verify_rc || $verify_rc -eq 0 ]] || exit 3

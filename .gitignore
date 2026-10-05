@@ -1,0 +1,23 @@
+# Editor / backup leftovers
+*.swp
+*.swo
+*~
+*.bak
+__pycache__/
+
+# Claude Code runtime state - never commit
+.credentials.json
+settings.local.json
+history.jsonl
+projects/
+sessions/
+session-env/
+file-history/
+shell-snapshots/
+paste-cache/
+debug/
+skills/synced/
+
+# Personal / not for this repo
+*.local.md
+skills/job-scout-cz/
